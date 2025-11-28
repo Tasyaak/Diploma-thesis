@@ -1,0 +1,4 @@
+(sym_lib_table
+  (lib (name piezo_sensor)(type Legacy)(uri ${KIPRJMOD}/piezo_sensor.lib)(options "")(descr ""))
+  (lib (name piezo_sensor-rescue)(type Legacy)(uri ${KIPRJMOD}/piezo_sensor-rescue.lib)(options "")(descr ""))
+)

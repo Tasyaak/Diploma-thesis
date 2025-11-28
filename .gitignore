@@ -1,0 +1,116 @@
+############################
+# 1. Общие временные файлы #
+############################
+
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+Thumbs.db
+Desktop.ini
+
+########################################
+# 2. Python (Hantek_Software, скрипты) #
+########################################
+
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+.env
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.cache/
+.ipynb_checkpoints/
+
+##############################################
+# 3. Visual Studio / .NET / C++ (OsciloscopeNew)
+##############################################
+
+# Каталоги сборки
+[Bb]in/
+[Oo]bj/
+Debug/
+Release/
+x64/
+x86/
+
+# Служебные данные VS
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Промежуточные и отладочные файлы
+*.d
+*.slo
+*.lo
+*.o
+*.obj
+*.gch
+*.pch
+*.so
+*.dylib
+*.dll
+*.mod
+*.smod
+*.lai
+*.la
+*.a
+*.lib
+*.exe
+*.out
+*.app
+*.lock
+*.vsidx
+*.cache
+*.wsuo
+*.pdb
+*.ipdb
+*.iobj
+*.ilk
+*.idb
+*.tlog
+*.lastbuildstate
+*.VC.db
+*.VC.VC.opendb
+*.vshost.exe
+
+##############################################
+# 4. STM32CubeIDE / Eclipse (Software_STM/f407_adc_dac)
+##############################################
+
+# Workspace STM32CubeIDE – локальный, в Git не нужен
+Software_STM/f407_adc_dac/.metadata/
+
+# Каталоги сборки STM-проекта (если появятся)
+Software_STM/f407_adc_dac/**/Debug/
+Software_STM/f407_adc_dac/**/Release/
+
+########################################
+# 5. KiCad-проект (Software_STM/piezo_sensor)
+########################################
+
+# Производственные файлы (герберы, сверловка)
+Software_STM/piezo_sensor/gerber/
+
+# Локальные настройки KiCad (обычно не хранят в VCS)
+Software_STM/piezo_sensor/*.kicad_prl
+
+# Временные / резервные файлы KiCad
+Software_STM/piezo_sensor/*-backups/
+Software_STM/piezo_sensor/*.bak
+
+############################
+# 6. IDE / редакторы (общие)
+############################
+
+.idea/
+.vscode/
+*.code-workspace

@@ -1,0 +1,3 @@
+(fp_lib_table
+  (lib (name piezo_sensor)(type KiCad)(uri ${KIPRJMOD}/piezo_sensor.pretty)(options "")(descr ""))
+)

@@ -1,0 +1,42 @@
+oscilloscope:
+  # Channel 1 configuration
+  ch1: 
+    name: Custom Channel 1 Name
+    probe-multiplier: 10
+    volt-division: 8
+    volts-per-division: 8
+    channel-coupling: 0
+    value-multiplier: 1.0
+    off-voltage-threshold: 1.0
+  
+  # Channel 2 configuration 
+  ch2: 
+    name: Custom Channel 2 Name
+    probe-multiplier: 1
+    volt-division: 8
+    volts-per-division: 8
+    channel-coupling: 0
+    value-multiplier: 4.0
+  
+  # General oscilloscope settings
+  window: 7
+  measurement-interval: 30
+  n-snapshots: 2
+  channel-mode: 4
+  channels-enabled: [1, 1, 1, 1]
+  channel-mask: 0x0F
+  
+  # Trigger settings
+  trigger-channel: 0
+  trigger-slope: 0
+  trigger-mode: 0
+  trigger-sweep: 0
+  trigger-voltage: 0
+  
+  # Buffer settings
+  buffer-length: 4096
+  read-every-sample: 1
+  yt-mode: 0
+
+# Output directory for data files
+export_dir: custom_outputs
