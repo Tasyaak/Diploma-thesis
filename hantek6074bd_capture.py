@@ -1,13 +1,13 @@
-import argparse, os, time, ctypes as ct
+import os, time, ctypes as ct, numpy as np
 from dataclasses import dataclass
 from enum import IntEnum, IntFlag
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Tuple, Optional, Literal
 from ctypes import wintypes
 
 
 # =========================
-# 1) Константы/типы SDK
+# Константы/типы SDK
 # =========================
 
 MAX_CH_NUM = 4
@@ -65,7 +65,7 @@ class DeviceState(IntFlag):
     DONE = 1 << 1
 
 
-# Таблица индексов Volt/Div → реальное значение (V/div)
+# Таблица индексов Volt/Div → реальное значение (V/div) из мануала SDK
 VOLT_DIV_V = {
     0: 2e-3,  1: 5e-3,  2: 10e-3, 3: 20e-3,
     4: 50e-3, 5: 100e-3, 6: 200e-3, 7: 500e-3,
@@ -74,11 +74,10 @@ VOLT_DIV_V = {
 
 
 # =========================
-# 2) Структуры SDK (ctypes.Structure)
+# Структуры SDK (ctypes.Structure)
 # =========================
 # В ctypes структуры описываются через наследование от ctypes.Structure и _fields_
 # (это стандартный механизм ctypes для C-структур)
-
 
 class RELAYCONTROL(ct.Structure):
     _fields_ = [
@@ -97,8 +96,8 @@ class CONTROLDATA(ct.Structure):
         ("nCHSet", WORD),
         ("nTimeDIV", WORD),
         ("nTriggerSource", WORD),
-        ("nHTriggerPos", WORD),
-        ("nVTriggerPos", WORD),
+        ("nHTriggerPos", WORD),     # pretrigger %, 0..100
+        ("nVTriggerPos", WORD),     # trigger level pos, 0..255 (условно)
         ("nTriggerSlope", WORD),
         ("nBufferLen", UINT),
         ("nReadDataLen", UINT),
@@ -111,41 +110,53 @@ class CONTROLDATA(ct.Structure):
     ]
 
 
-# =========================
-# 3) Dataclass-конфигурация
-# =========================
+# -------------------------
+# Параметры захвата (CH1-only)
+# -------------------------
 
 @dataclass(frozen=True)
-class ChannelConfig:
-    enabled: bool = True
-    volt_div_idx: int = 5           # 100 mV/div
-    coupling: Coupling = Coupling.DC
-    bw_limit: bool = False
-    # "вертикальная позиция" (0..255): влияет на смещение кодов в данных
-    lever_pos: int = 128            # условно "центр"
+class ScanParams:
+    # waveform window
+    time_div_idx : int = 9
+    read_len : int = 0x1000
+    pretrigger_percent : int = 50
+    yt_format : YTFormat = YTFormat.NORMAL
+
+    # channel CH1
+    volt_div_idx : int = 5               # 100 mV/div
+    coupling : Coupling = Coupling.DC
+    bw_limit : bool = False
+    lever_pos : int = 128                # вертикальная позиция 0..255, условно центр
+
+    # trigger
+    trig_source : Channel = Channel.CH1
+    trig_mode : TriggerMode = TriggerMode.EDGE
+    trig_slope : TriggerSlope = TriggerSlope.RISE
+    trig_level_pos : int = 128
+
+    # acquisition control
+    start_control : StartControl = StartControl.AUTO    # режим запуска
+    timeout_s : float = 2.0
+    poll_s : float = 0.001
 
 
 @dataclass(frozen=True)
-class TriggerConfig:
-    source: Channel = Channel.CH1
-    mode: TriggerMode = TriggerMode.EDGE
-    slope: TriggerSlope = TriggerSlope.RISE
-    # уровень триггера тоже в "позиционном" формате 0..255
-    level_pos: int = 128
-
-
-@dataclass(frozen=True)
-class CaptureConfig:
-    time_div_idx: int = 9           # индекс таймбазы (см. таблицу SDK)
-    read_len: int = 0x1000          # 4096 точек
-    pretrigger_percent: int = 50    # 0..100
-    yt_format: YTFormat = YTFormat.NORMAL
-    # режим запуска
-    start_control: StartControl = StartControl.AUTO
+class AScanFrame:
+    """
+    t и raw могут быть view на внутренний буфер (если copy=False), при следующем capture() данные будут перезаписаны
+    t — кэшируемый массив времени (не меняется при фиксированных параметрах)
+    """
+    point : Optional[Tuple[float, float]]
+    fs_hz : float
+    dt_s : float
+    t_s : np.ndarray
+    triggered : bool
+    volts : Optional[np.ndarray] = None
+    raw_u16 : Optional[np.ndarray] = None
 
 
 # =========================
-# 4) Исключения и проверки
+# Исключения и проверки
 # =========================
 
 class HantekError(RuntimeError):
@@ -162,42 +173,223 @@ def _check_ok(name : str, ok : int) -> None:
 
 
 # =========================
-# 5) Обёртка над HTHardDll.dll
+# Обёртка над HTHardDll.dll
 # =========================
 
 class HantekHardDll:
     """
-    Тонкая обёртка над HTHardDll.dll:
-    - загружает DLL
-    - задаёт argtypes/restype для функций
-      (это защищает от неверных типов и помогает ctypes конвертировать аргументы)
+    Тонкая обёртка над HTHardDll.dll
     """
+    def __init__(self, dll_dir : Path, *, channel_mode : int = 4, device_index : Optional[int] = None, max_devices : int = 32) -> None:
+        self.channel_mode = int(channel_mode)
+        self.max_devices = int(max_devices)
 
-    def __init__(self, dll_dir : Path):
-        self.dll_dir = dll_dir
-        if not dll_dir.exists():
-            raise FileNotFoundError(f"dll_dir does not exist: {dll_dir}")
-
-        # Python 3.8+: добавляем путь в DLL-search.
-        # Документация прямо говорит, что этот путь используется и ctypes. :contentReference[oaicite:5]{index=5}
-        self._dll_handle = os.add_dll_directory(str(dll_dir))
+        # Python 3.8+: добавляем путь в DLL-search
+        # Документация прямо говорит, что этот путь используется и ctypes
+        self._dll_cookie = os.add_dll_directory(str(dll_dir))
 
         dll_path = dll_dir / "HTHardDll.dll"
         if not dll_path.exists():
             raise FileNotFoundError(f"HTHardDll.dll not found: {dll_path}")
 
-        # WinDLL/windll на Windows использует stdcall-соглашение вызова. :contentReference[oaicite:6]{index=6}
+        # WinDLL/windll на Windows использует stdcall-соглашение вызова
         self.lib = ct.WinDLL(str(dll_path))
-
         self._bind_prototypes()
+        self.device_index = device_index if device_index is not None else self._find_device()
+
+        # init один раз
+        _check_ok("dsoInitHard", self.lib.dsoInitHard(WORD(self.device_index)))
+        _check_ok("dsoHTADCCHModGain", self.lib.dsoHTADCCHModGain(WORD(self.device_index), WORD(self.channel_mode)))
+
+        # Будет заполнено при configure()
+        self.params : Optional[ScanParams] = None
+        self.fs_hz : float = 0.0
+        self.dt_s : float = 0.0
+        
+        # Структуры управления — живут весь скан
+        self._relay = RELAYCONTROL()
+        self._ctrl = CONTROLDATA()
+
+        # Буферы данных (4 канала) — выделим при configure()
+        self._buf_len : int = 0
+        self._ch1_buf : Optional[ct.Array[WORD]] = None
+        self._ch2_buf : Optional[ct.Array[WORD]] = None
+        self._ch3_buf : Optional[ct.Array[WORD]] = None
+        self._ch4_buf : Optional[ct.Array[WORD]] = None
+
+        # Кэш времени (при фиксированных параметрах строится один раз)
+        self._t_cache : Optional[np.ndarray] = None
 
     def close(self) -> None:
         # освобождаем добавленный DLL-directory
         try:
-            self._dll_handle.close()
+            self._dll_cookie.close()
         except Exception:
             pass
+    
+    def __enter__(self) -> "HantekHardDll":
+        return self
 
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+    
+    def configure(self, params : ScanParams) -> None:
+        """
+        Применить параметры к прибору 1 раз перед сканом
+        После этого можно вызывать capture(point) сколько угодно раз
+        Повторный configure() допустим между сканами
+        """
+
+        self.params = params
+        self._ensure_buffers(params.read_len)
+        self._fill_structs(params)
+
+        # Основные "тяжёлые" вызовы конфигурации
+        _check_ok("dsoHTSetSampleRate",
+            self.lib.dsoHTSetSampleRate(
+                WORD(self.device_index),
+                WORD(int(params.yt_format)),
+                ct.byref(self._relay),
+                ct.byref(self._ctrl),
+            ))
+
+        _check_ok("dsoHTSetCHAndTrigger",
+            self.lib.dsoHTSetCHAndTrigger(
+                WORD(self.device_index),
+                ct.byref(self._relay),
+                WORD(params.time_div_idx),
+            ))
+
+        _check_ok("dsoHTSetRamAndTrigerControl",
+            self.lib.dsoHTSetRamAndTrigerControl(
+                WORD(self.device_index),
+                WORD(params.time_div_idx),
+                WORD(int(self._ctrl.nCHSet)),
+                WORD(int(params.trig_source)),
+                WORD(0),
+            ))
+
+        # “лёгкие” настройки
+        _check_ok("dsoHTSetCHPos",
+            self.lib.dsoHTSetCHPos(
+                WORD(self.device_index),
+                WORD(params.volt_div_idx),
+                WORD(params.lever_pos),
+                WORD(int(Channel.CH1)),
+                WORD(self.channel_mode),
+            ))
+
+        _check_ok("dsoHTSetVTriggerLevel",
+            self.lib.dsoHTSetVTriggerLevel(
+                WORD(self.device_index),
+                WORD(params.trig_level_pos),
+                WORD(self.channel_mode),
+            ))
+
+        _check_ok("dsoHTSetTrigerMode",
+            self.lib.dsoHTSetTrigerMode(
+                WORD(self.device_index),
+                WORD(int(params.trig_mode)),
+                WORD(int(params.trig_slope)),
+                WORD(int(params.coupling)),
+            ))
+
+        # Фактическая fs (после set_sample_rate)
+        self.fs_hz = float(self.lib.dsoGetSampleRate(WORD(self.device_index)))
+        self.dt_s = 1.0 / self.fs_hz if self.fs_hz > 0 else 0.0
+
+        if self.fs_hz <= 0:
+            raise HantekError("Sample rate is zero after configure(); check time_div_idx / device state")
+        
+        # Кэш оси времени
+        self._t_cache = self._build_time_axis(
+            n=params.read_len,
+            dt=self.dt_s,
+            pretrigger_percent=params.pretrigger_percent,
+        )
+
+    def capture(
+        self,
+        *,
+        point : Optional[Tuple[float, float]] = None,
+        return_mode : Literal["raw", "volts", "both"] = "volts",
+        copy : bool = False,
+    ) -> AScanFrame:
+        """
+        Один захват A-scan в текущей точке (CH1)
+
+        return_mode:
+          - "volts": вернуть только volts (экономия памяти)
+          - "raw": вернуть только raw_u16
+          - "both": вернуть volts + raw_u16
+
+        copy:
+          - False (по умолчанию): максимальная скорость, данные = view на внутренний буфер
+          - True: массивы копируются и безопасны для хранения
+        """
+        if self.params is None or self._t_cache is None:
+            raise RuntimeError("Call configure(params) before capture().")
+
+        p = self.params
+        # старт
+        _check_ok("dsoHTStartCollectData",
+            self.lib.dsoHTStartCollectData(WORD(self.device_index), WORD(int(p.start_control))))
+
+        # ожидание DONE, параллельно отмечаем TRIGGERED
+        triggered = False
+        t0 = time.time()
+        while True:
+            st = DeviceState(int(self.lib.dsoHTGetState(WORD(self.device_index))))
+            if st & DeviceState.TRIGGERED:
+                triggered = True
+            if st & DeviceState.DONE:
+                break
+            if time.time() - t0 >= p.timeout_s:
+                raise TimeoutError(f"Capture timeout {p.timeout_s}s; state={int(st):#x}")
+            time.sleep(p.poll_s)
+
+        # чтение данных в буферы
+        assert self._ch1_buf is not None
+        assert self._ch2_buf is not None
+        assert self._ch3_buf is not None
+        assert self._ch4_buf is not None
+
+        _check_ok("dsoHTGetData",
+            self.lib.dsoHTGetData(
+                WORD(self.device_index),
+                self._ch1_buf, self._ch2_buf, self._ch3_buf, self._ch4_buf,
+                ct.byref(self._ctrl),
+            ))
+    
+        n = int(self._ctrl.nReadDataLen)
+
+        # raw view (нулевая копия)
+        raw_view = np.ctypeslib.as_array(self._ch1_buf)[:n]
+        # raw_view = np.ctypeslib.as_array(self._ch1_buf)[:n].astype(np.uint16, copy=False)
+
+        # t axis — кэшированный (при copy=True отдаём копию, иначе общий массив)
+        t_out = self._t_cache[:n].copy() if copy else self._t_cache[:n]
+
+        volts_out : Optional[np.ndarray] = None
+        raw_ret : Optional[np.ndarray] = None
+
+        if return_mode in {"raw", "both"}:
+            raw_ret = raw_view.copy() if copy else raw_view
+
+        if return_mode in {"volts", "both"}:
+            volts_view = self._raw_to_volts(raw_view, p)
+            volts_out = volts_view.copy() if copy else volts_view
+
+        return AScanFrame(
+            point=point,
+            fs_hz=self.fs_hz,
+            dt_s=self.dt_s,
+            t_s=t_out,
+            triggered=triggered,
+            volts=volts_out,
+            raw_u16=raw_ret,
+        )
+    
     def _bind_prototypes(self) -> None:
         L = self.lib
 
@@ -248,273 +440,95 @@ class HantekHardDll:
         L.dsoGetSampleRate.argtypes = [WORD]
         L.dsoGetSampleRate.restype = ct.c_float
 
-    # --- удобные прокси-методы ---
-    def device_connect(self, idx: int) -> bool:
-        return bool(self.lib.dsoHTDeviceConnect(WORD(idx)))
-
-    def init_hardware(self, dev: int) -> None:
-        _check_ok("dsoInitHard", self.lib.dsoInitHard(WORD(dev)))
-
-    def set_channel_mode_gain(self, dev: int, ch_mode: int) -> None:
-        _check_ok("dsoHTADCCHModGain", self.lib.dsoHTADCCHModGain(WORD(dev), WORD(ch_mode)))
-
-    def set_sample_rate(self, dev: int, yt: YTFormat, relay: RELAYCONTROL, ctrl: CONTROLDATA) -> None:
-        _check_ok("dsoHTSetSampleRate", self.lib.dsoHTSetSampleRate(WORD(dev), WORD(int(yt)), ct.byref(relay), ct.byref(ctrl)))
-
-    def set_ch_and_trigger(self, dev: int, relay: RELAYCONTROL, time_div_idx: int) -> None:
-        _check_ok("dsoHTSetCHAndTrigger", self.lib.dsoHTSetCHAndTrigger(WORD(dev), ct.byref(relay), WORD(time_div_idx)))
-
-    def set_ram_trigger_ctrl(self, dev: int, time_div_idx: int, ch_set_mask: int, trig_src: int, peak: int = 0) -> None:
-        _check_ok("dsoHTSetRamAndTrigerControl",
-                  self.lib.dsoHTSetRamAndTrigerControl(WORD(dev), WORD(time_div_idx), WORD(ch_set_mask), WORD(trig_src), WORD(peak)))
-
-    def set_ch_pos(self, dev: int, volt_div_idx: int, lever_pos: int, ch: Channel, ch_mode: int) -> None:
-        _check_ok("dsoHTSetCHPos", self.lib.dsoHTSetCHPos(WORD(dev), WORD(volt_div_idx), WORD(lever_pos), WORD(int(ch)), WORD(ch_mode)))
-
-    def set_trigger_level(self, dev: int, level_pos: int, ch_mode: int) -> None:
-        _check_ok("dsoHTSetVTriggerLevel", self.lib.dsoHTSetVTriggerLevel(WORD(dev), WORD(level_pos), WORD(ch_mode)))
-
-    def set_trigger_mode(self, dev: int, mode: TriggerMode, slope: TriggerSlope, coupling: Coupling) -> None:
-        _check_ok("dsoHTSetTrigerMode", self.lib.dsoHTSetTrigerMode(WORD(dev), WORD(int(mode)), WORD(int(slope)), WORD(int(coupling))))
-
-    def start_collect(self, dev: int, start_control: StartControl) -> None:
-        _check_ok("dsoHTStartCollectData", self.lib.dsoHTStartCollectData(WORD(dev), WORD(int(start_control))))
-
-    def get_state(self, dev: int) -> DeviceState:
-        return DeviceState(int(self.lib.dsoHTGetState(WORD(dev))))
-
-    def get_data(self, dev: int, ch1: ct.Array, ch2: ct.Array, ch3: ct.Array, ch4: ct.Array, ctrl: CONTROLDATA) -> None:
-        _check_ok("dsoHTGetData", self.lib.dsoHTGetData(WORD(dev), ch1, ch2, ch3, ch4, ct.byref(ctrl)))
-
-    def get_sample_rate(self, dev: int) -> float:
-        return float(self.lib.dsoGetSampleRate(WORD(dev)))
-
-
-# =========================
-# 6) Высокоуровневый класс “осциллограф”
-# =========================
-
-class Hantek6074BD:
-    """
-    Высокоуровневый интерфейс:
-      - найти устройство
-      - применить конфиг
-      - старт/ожидание
-      - чтение + конвертация в (t, V)
-    """
-
-    def __init__(self, dll_dir : Path):
-        self.hard = HantekHardDll(dll_dir)
-
-    def close(self) -> None:
-        self.hard.close()
-
-    def find_first_device(self, max_devices: int = 32) -> int:
-        for idx in range(max_devices):
-            if self.hard.device_connect(idx):
+    def _find_device(self) -> int:
+        for idx in range(self.max_devices):
+            if self.lib.dsoHTDeviceConnect(WORD(idx)):
                 return idx
-        raise HantekError("Device not found: dsoHTDeviceConnect returned 0 for all indices")
+        raise HantekError("Device not found (dsoHTDeviceConnect==0 for all indices).")
+
+    def _ensure_buffers(self, n : int) -> None:
+        if self._buf_len >= n and self._ch1_buf is not None:
+            return
+        self._buf_len = n
+        self._ch1_buf = (WORD * n)()
+        self._ch2_buf = (WORD * n)()
+        self._ch3_buf = (WORD * n)()
+        self._ch4_buf = (WORD * n)()
+
+    def _fill_structs(self, p : ScanParams) -> None:
+        # RelayControl: включаем только CH1 (остальные выключены)
+        for ch in range(MAX_CH_NUM):
+            enabled = 1 if ch == int(Channel.CH1) else 0
+            self._relay.bCHEnable[ch] = enabled
+            self._relay.nCHVoltDIV[ch] = WORD(p.volt_div_idx)
+            self._relay.nCHCoupling[ch] = WORD(int(p.coupling))
+            self._relay.bCHBWLimit[ch] = 1 if p.bw_limit else 0
+
+        self._relay.nTrigSource = WORD(int(p.trig_source))
+        self._relay.bTrigFilt = 0
+        self._relay.nALT = 0
+
+        # ControlData
+        ch_mask = 0x01  # CH1
+        self._ctrl.nCHSet = WORD(ch_mask)
+        self._ctrl.nTimeDIV = WORD(p.time_div_idx)
+        self._ctrl.nTriggerSource = WORD(int(p.trig_source))
+        self._ctrl.nHTriggerPos = WORD(p.pretrigger_percent)
+        self._ctrl.nVTriggerPos = WORD(p.trig_level_pos)
+        self._ctrl.nTriggerSlope = WORD(int(p.trig_slope))
+        self._ctrl.nBufferLen = UINT(p.read_len)
+        self._ctrl.nReadDataLen = UINT(p.read_len)
+        self._ctrl.nAlreadyReadLen = UINT(0)
+        self._ctrl.nALT = 0
+        self._ctrl.nETSOpen = 0
+        self._ctrl.nDriverCode = 0
+        self._ctrl.nLastAddress = 0
+        self._ctrl.nFPGAVersion = 0
 
     @staticmethod
-    def _build_structs(ch_cfgs : List[ChannelConfig],
-                       trig_cfg : TriggerConfig,
-                       cap_cfg : CaptureConfig) -> Tuple[RELAYCONTROL, CONTROLDATA, int]:
+    def _build_time_axis(*, n : int, dt : float, pretrigger_percent : int) -> np.ndarray:
+        trig_idx = int(round(n * (pretrigger_percent / 100.0)))
+        return (np.arange(n, dtype=np.float64) - trig_idx) * dt
+
+    @staticmethod
+    def _raw_to_volts(raw_u16 : np.ndarray, p : ScanParams) -> np.ndarray:
         """
-        Собираем RELAYCONTROL + CONTROLDATA из удобных python-конфигов.
-        Возвращаем также ch_set_mask.
+        Перевод raw -> volts
+        Здесь сосредоточено место, которое вы будете “калибровать” под свой тракт:
+          - деление на 32 (кванта/деление)
+          - смещение через lever_pos
+          - умножение на V/div
         """
-        relay = RELAYCONTROL()
-        ctrl = CONTROLDATA()
-
-        ch_set_mask = 0
-        for ch in range(MAX_CH_NUM):
-            cfg = ch_cfgs[ch]
-
-            relay.bCHEnable[ch] = 1 if cfg.enabled else 0
-            relay.nCHVoltDIV[ch] = WORD(cfg.volt_div_idx)
-            relay.nCHCoupling[ch] = WORD(int(cfg.coupling))
-            relay.bCHBWLimit[ch] = 1 if cfg.bw_limit else 0
-
-            if cfg.enabled:
-                ch_set_mask |= (1 << ch)
-
-        relay.nTrigSource = WORD(int(trig_cfg.source))
-        relay.bTrigFilt = 0
-        relay.nALT = 0
-
-        ctrl.nCHSet = WORD(ch_set_mask)
-        ctrl.nTimeDIV = WORD(cap_cfg.time_div_idx)
-        ctrl.nTriggerSource = WORD(int(trig_cfg.source))
-        ctrl.nHTriggerPos = WORD(cap_cfg.pretrigger_percent)
-        ctrl.nVTriggerPos = WORD(trig_cfg.level_pos)
-        ctrl.nTriggerSlope = WORD(int(trig_cfg.slope))
-        ctrl.nBufferLen = UINT(cap_cfg.read_len)
-        ctrl.nReadDataLen = UINT(cap_cfg.read_len)
-        ctrl.nAlreadyReadLen = UINT(0)
-
-        ctrl.nALT = 0
-        ctrl.nETSOpen = 0
-        ctrl.nDriverCode = 0
-        ctrl.nLastAddress = 0
-        ctrl.nFPGAVersion = 0
-
-        return relay, ctrl, ch_set_mask
-
-    def configure_and_capture_ch1(
-        self,
-        dev : int,
-        ch1_cfg : ChannelConfig,
-        trig_cfg : TriggerConfig,
-        cap_cfg : CaptureConfig,
-        *,
-        ch_mode : int = 4,               # в демо для 4-канальных приборов часто используется 4
-        timeout_s : float = 2.0,
-        poll_s : float = 0.001,
-    ) -> Tuple[List[float], List[float], float]:
-        """
-        Делает один захват CH1 и возвращает:
-          t (сек), v (вольты), fs (Гц)
-        """
-        # для простоты: CH1 настраиваем, остальные отключаем
-        ch_cfgs = [
-            ch1_cfg,
-            ChannelConfig(enabled=False),
-            ChannelConfig(enabled=False),
-            ChannelConfig(enabled=False),
-        ]
-
-        relay, ctrl, ch_mask = self._build_structs(ch_cfgs, trig_cfg, cap_cfg)
-
-        # 1) init
-        self.hard.init_hardware(dev)
-        self.hard.set_channel_mode_gain(dev, ch_mode)
-
-        # 2) применить конфигурацию (частота/каналы/триггер/память)
-        self.hard.set_sample_rate(dev, cap_cfg.yt_format, relay, ctrl)
-        self.hard.set_ch_and_trigger(dev, relay, cap_cfg.time_div_idx)
-        self.hard.set_ram_trigger_ctrl(dev, cap_cfg.time_div_idx, ch_mask, int(trig_cfg.source), peak=0)
-
-        # позиции/уровни (часто критично для корректного “центра” и триггера)
-        self.hard.set_ch_pos(dev, ch1_cfg.volt_div_idx, ch1_cfg.lever_pos, Channel.CH1, ch_mode)
-        self.hard.set_trigger_level(dev, trig_cfg.level_pos, ch_mode)
-        self.hard.set_trigger_mode(dev, trig_cfg.mode, trig_cfg.slope, ch1_cfg.coupling)
-
-        # 3) старт
-        self.hard.start_collect(dev, cap_cfg.start_control)
-
-        # 4) ожидание окончания (бит DONE)
-        t0 = time.time()
-        while True:
-            st = self.hard.get_state(dev)
-            if st & DeviceState.DONE:
-                break
-            if time.time() - t0 >= timeout_s:
-                raise TimeoutError(
-                    f"Capture timeout ({timeout_s}s). "
-                    f"State={int(st):#x}. Проверьте trigger level/slope/timebase."
-                )
-            time.sleep(poll_s)
-
-        # 5) чтение буферов
-        n = int(ctrl.nReadDataLen)
-        ch1 = (WORD * n)()
-        ch2 = (WORD * n)()
-        ch3 = (WORD * n)()
-        ch4 = (WORD * n)()
-
-        self.hard.get_data(dev, ch1, ch2, ch3, ch4, ctrl)
-
-        # 6) фактическая частота дискретизации
-        fs = self.hard.get_sample_rate(dev)
-        dt = 1.0 / fs if fs > 0 else 0.0
-
-        # 7) конвертация codes -> volts
-        # По мануалу/демо для этой серии обычно используется шкала “32 кванта на деление”.
-        # Вольты = (counts / 32) * (V/div).
-        vdiv = VOLT_DIV_V.get(ch1_cfg.volt_div_idx)
-        if vdiv is None:
-            raise ValueError(f"Unknown volt_div_idx={ch1_cfg.volt_div_idx}, update VOLT_DIV_V mapping")
-
-        # В данных часто присутствует смещение из-за lever_pos (вертикальной позиции).
-        # Здесь используем ту же практику, что в демо: raw - (MAX_DATA - lever_pos)
-        y = [ (int(ch1[i]) - (MAX_DATA - ch1_cfg.lever_pos)) / 32.0 * vdiv for i in range(n) ]
-        t = [ i * dt for i in range(n) ]
-
-        return t, y, fs
+        vdiv = VOLT_DIV_V[p.volt_div_idx]
+        return (raw_u16.astype(np.float64) - (MAX_DATA - p.lever_pos)) / 32.0 * vdiv
 
 
-# =========================
-# 7) Сохранение + CLI
-# =========================
-
-def save_tsv(path : Path, t : Iterable[float], y : Iterable[float], *, fs : float, meta : dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        # “человеческий” заголовок с метаданными (удобно для отчёта/проверки)
-        f.write("# Hantek 6074BD capture\n")
-        f.write(f"# fs_hz={fs:.6f}\n")
-        for k, v in meta.items():
-            f.write(f"# {k}={v}\n")
-        f.write("t_s\tch1_v\n")
-        for ti, yi in zip(t, y):
-            f.write(f"{ti:.9e}\t{yi:.9e}\n")
+def main() -> None:
+    test()
 
 
-DLL_DIR = Path(__file__).resolve().parent / "Hantek_Software" / "Hantek_SDK" / "Dll" / "x64"
+def test() -> None:
+    dll_dir = Path(__file__).resolve().parent / "Hantek_Software" / "Hantek_SDK" / "Dll" / "x64"
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="capture_ch1.tsv", help="Выходной файл TSV")
-    ap.add_argument("--time-div", type=int, default=9, help="Индекс TimeDiv (из таблицы SDK)")
-    ap.add_argument("--volt-div", type=int, default=5, help="Индекс Volt/Div (0..11)")
-    ap.add_argument("--len", type=int, default=0x1000, help="Число точек (например 0x1000)")
-    ap.add_argument("--timeout", type=float, default=2.0, help="Таймаут ожидания окончания захвата (сек)")
-    args = ap.parse_args()
+    params = ScanParams(
+        time_div_idx=9,
+        read_len=0x4000,
+        volt_div_idx=5,
+        pretrigger_percent=50,
+        trig_level_pos=128,
+        # остальное по умолчанию
+    )
 
-    out = Path(args.out)
+    with HantekHardDll(dll_dir) as scope:
+        scope.configure(params)  # один раз перед сканом
 
-    scope = Hantek6074BD(DLL_DIR)
-    try:
-        dev = scope.find_first_device()
+        for (x, y) in grid_points:
+            move_probe_to(x, y)   # ваша программа
+            frame = scope.capture(point=(x, y), return_mode="volts", copy=False)
 
-        ch1_cfg = ChannelConfig(
-            enabled=True,
-            volt_div_idx=args.volt_div,
-            coupling=Coupling.DC,
-            bw_limit=False,
-            lever_pos=128,
-        )
-        trig_cfg = TriggerConfig(
-            source=Channel.CH1,
-            mode=TriggerMode.EDGE,
-            slope=TriggerSlope.RISE,
-            level_pos=128,
-        )
-        cap_cfg = CaptureConfig(
-            time_div_idx=args.time_div,
-            read_len=args.len,
-            pretrigger_percent=50,
-            yt_format=YTFormat.NORMAL,
-            start_control=StartControl.AUTO,
-        )
-
-        t, y, fs = scope.configure_and_capture_ch1(dev, ch1_cfg, trig_cfg, cap_cfg, timeout_s=args.timeout)
-
-        meta = {
-            "device_index": dev,
-            "time_div_idx": cap_cfg.time_div_idx,
-            "read_len": cap_cfg.read_len,
-            "volt_div_idx": ch1_cfg.volt_div_idx,
-            "coupling": int(ch1_cfg.coupling),
-            "trigger_level_pos": trig_cfg.level_pos,
-            "trigger_slope": int(trig_cfg.slope),
-        }
-        save_tsv(out, t, y, fs=fs, meta=meta)
-        print(f"Saved: {out.resolve()}")
-        return 0
-
-    finally:
-        scope.close()
+            # frame.point, frame.t_s, frame.volts
+            # Важно: copy=False => frame.volts перезапишется на следующем capture().
+            # Если нужно хранить — используйте copy=True или сразу сохраняйте/обрабатывайте.
 
 
 if __name__ == "__main__":
